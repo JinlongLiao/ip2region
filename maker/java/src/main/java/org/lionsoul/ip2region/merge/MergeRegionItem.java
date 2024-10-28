@@ -21,7 +21,12 @@ public class MergeRegionItem implements Comparable<MergeRegionItem> {
         this.ip = ipToLong(split[0]);
         this.country = (split[4]);
         this.province = (split[5]);
-        this.city = (split[6]);
+        try {
+            this.city = (split[6]);
+
+        }catch (RuntimeException e) {
+            throw e;
+        }
     }
 
     public long getIp() {
