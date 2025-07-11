@@ -18,6 +18,7 @@ public class AreaIsp extends Area {
         return isp;
     }
 
+    @Override
     public String toString() {
         return "AreaIsp(super=" + super.toString() + ", isp=" + this.isp + ")";
     }
