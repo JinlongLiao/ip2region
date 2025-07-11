@@ -186,6 +186,7 @@ public class MergeTest {
         while (true) {
             String string = bufferedReader.readLine();
             if (Objects.isNull(string) || string.isEmpty()) break;
+            System.out.println("string = " + string);
             mergeRegionItems.add(new MergeRegionItem(string));
         }
         bufferedReader.close();

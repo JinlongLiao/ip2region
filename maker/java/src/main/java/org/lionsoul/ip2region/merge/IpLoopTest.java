@@ -13,10 +13,9 @@ public class IpLoopTest {
     static IpDataCloudIpHelper ipDataCloudIpHelper = new IpDataCloudIpHelper();
 
     public static void main(String[] args) throws IOException {
-
         StringBuilder buffer = new StringBuilder();
-        int startIp = ip2Int("46.232.0.0", 0);
-        int endIp = ip2Int("46.232.119.255", 0);
+        int startIp = ip2Int("8.211.208.0", 0);
+        int endIp = ip2Int("8.219.1.255", 0);
         while (isLegalIp(startIp, endIp)) {
             String ip = intToIpv4(startIp);
             AreaIsp areaIsp = ipDataCloudIpHelper.queryIp(ip);
@@ -24,7 +23,6 @@ public class IpLoopTest {
                 continue;
             }
             buffer.append(ip);
-            buffer.append(",");
             buffer.append(",0,0,0,");
             buffer.append(areaIsp.getCountry());
             buffer.append(",");
