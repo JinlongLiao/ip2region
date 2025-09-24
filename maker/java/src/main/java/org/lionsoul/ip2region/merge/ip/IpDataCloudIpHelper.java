@@ -1,8 +1,9 @@
 package org.lionsoul.ip2region.merge.ip;
 
-import com.wlzn.common.parent.web.common.http.HttpHelper;
-import com.wlzn.common.parent.web.common.http.HttpResp;
+
 import com.wlzn.common.parent.web.common.json.JsonHelper;
+import com.wlzn.common.util.http.HttpHelper;
+import com.wlzn.common.util.http.HttpResp;
 import org.lionsoul.ip2region.merge.ip.pojo.AreaIsp;
 import org.lionsoul.ip2region.merge.ip.pojo.Data;
 import org.lionsoul.ip2region.merge.ip.pojo.IpDataCloudResp;
