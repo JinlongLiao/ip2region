@@ -71,7 +71,7 @@ public class IpDataCloudIpHelper {
 
     protected AreaIsp _queryIp(String ip) {
 
-        String url = "https://api.ipdatacloud.com/v2/query?key=f1fba3a8972b11efbbb800163e167ffb&ip=" + ip;
+        String url = "https://api.ipdatacloud.com/v2/query?key=676d6d03b87411f09e5e00163e167ffb&ip=" + ip;
         try {
             HttpResp httpResp = HttpHelper.get(url, null, null);
             if (httpResp.isOk()) {
