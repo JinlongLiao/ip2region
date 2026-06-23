@@ -19,7 +19,7 @@ import java.util.Objects;
  * @author: liaojinlong
  * @date: 2024-11-07 14:58
  */
-public class IpDataCloudIpHelper {
+public class IpDataCloudIpHelper implements IpHelper {
 
     private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 

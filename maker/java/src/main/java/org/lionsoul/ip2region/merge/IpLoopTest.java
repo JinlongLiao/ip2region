@@ -1,27 +1,35 @@
 package org.lionsoul.ip2region.merge;
 
-import org.lionsoul.ip2region.merge.ip.IpDataCloudIpHelper;
+import org.lionsoul.ip2region.merge.ip.BaiduQifuIpHelper;
+import org.lionsoul.ip2region.merge.ip.IpApiComIpHelper;
+import org.lionsoul.ip2region.merge.ip.IpHelper;
+import org.lionsoul.ip2region.merge.ip.RateLimitedRoundRobinIpHelper;
 import org.lionsoul.ip2region.merge.ip.pojo.AreaIsp;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Files;
+import java.util.Arrays;
 import java.util.Objects;
 
 public class IpLoopTest {
-    static IpDataCloudIpHelper ipDataCloudIpHelper = new IpDataCloudIpHelper();
+    static IpHelper ipHelper = new RateLimitedRoundRobinIpHelper(
+            Arrays.asList(new IpApiComIpHelper(), new BaiduQifuIpHelper()), 500L);
 
     public static void main(String[] args) throws IOException {
-        StringBuilder buffer = new StringBuilder();
-        int startIp = ip2Int("8.211.208.0", 0);
-        int endIp = ip2Int("8.219.1.255", 0);
+        StringBuilder all = new StringBuilder();
+        int startIp = ip2Int("162.128.200.8", 0);
+        int endIp = ip2Int("162.132.200.8", 0);
         while (isLegalIp(startIp, endIp)) {
             String ip = intToIpv4(startIp);
-            AreaIsp areaIsp = ipDataCloudIpHelper.queryIp(ip);
+            int nextIp = ip2Int(ip, 1);
+            AreaIsp areaIsp = ipHelper.queryIp(ip);
             if (Objects.isNull(areaIsp)) {
+                startIp = nextIp;
                 continue;
             }
+            StringBuilder buffer = new StringBuilder();
             buffer.append(ip);
             buffer.append(",0,0,0,");
             buffer.append(areaIsp.getCountry());
@@ -32,13 +40,14 @@ public class IpLoopTest {
             buffer.append(",");
             buffer.append(areaIsp.getIsp());
             buffer.append("\n");
-            startIp = ip2Int(ip, 1);
-            System.out.println("ip = " + ip);
+            startIp = nextIp;
+            System.out.println(buffer);
+            all.append(buffer);
         }
         URL resource = IpLoopTest.class.getResource("/merget.txt");
         File file = new File(resource.getFile());
         file.createNewFile();
-        Files.write(file.toPath(), buffer.toString().getBytes());
+        Files.write(file.toPath(), all.toString().getBytes());
     }
 
     static boolean isLegalIp(int startIp, int endIp) {
