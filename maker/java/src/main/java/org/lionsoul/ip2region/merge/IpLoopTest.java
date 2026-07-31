@@ -15,12 +15,12 @@ import java.util.Objects;
 
 public class IpLoopTest {
     static IpHelper ipHelper = new RateLimitedRoundRobinIpHelper(
-            Arrays.asList(new IpApiComIpHelper(), new BaiduQifuIpHelper()), 500L);
+            Arrays.asList(/*new IpApiComIpHelper(), */new BaiduQifuIpHelper()), 50L);
 
     public static void main(String[] args) throws IOException {
         StringBuilder all = new StringBuilder();
-        int startIp = ip2Int("162.128.200.8", 0);
-        int endIp = ip2Int("162.132.200.8", 0);
+        int startIp = ip2Int("101.43.0.200", 0);
+        int endIp = ip2Int("101.46.1.200", 0);
         while (isLegalIp(startIp, endIp)) {
             String ip = intToIpv4(startIp);
             int nextIp = ip2Int(ip, 1);
