@@ -1,7 +1,6 @@
 package org.lionsoul.ip2region.merge;
 
 import org.lionsoul.ip2region.merge.ip.BaiduQifuIpHelper;
-import org.lionsoul.ip2region.merge.ip.IpApiComIpHelper;
 import org.lionsoul.ip2region.merge.ip.IpHelper;
 import org.lionsoul.ip2region.merge.ip.RateLimitedRoundRobinIpHelper;
 import org.lionsoul.ip2region.merge.ip.pojo.AreaIsp;
@@ -13,20 +12,37 @@ import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Objects;
 
+/**
+ * 按固定步长查询候选 IPv4 范围，并仅输出归属安徽省的地址信息。
+ *
+ * <p>工具每次选取一个地址作为对应 {@code /24} 网段的样本。查询失败或查询结果不属于安徽时跳过该样本，
+ * 最终将命中的结果写入 {@code merget.txt}。候选范围仍由 {@link #main(String[])} 中的起止地址控制。</p>
+ */
 public class IpLoopTest {
+
+    /**
+     * 带请求间隔控制的 IP 归属地查询器。
+     */
     static IpHelper ipHelper = new RateLimitedRoundRobinIpHelper(
             Arrays.asList(/*new IpApiComIpHelper(), */new BaiduQifuIpHelper()), 50L);
 
+    /**
+     * 查询候选 IP 范围，并将安徽省命中的样本覆盖写入 {@code merget.txt}。
+     *
+     * @param args 命令行参数，当前未使用
+     * @throws IOException 写入结果文件失败时抛出
+     */
     public static void main(String[] args) throws IOException {
         StringBuilder all = new StringBuilder();
-        int startIp = ip2Int("101.43.0.200", 0);
-        int endIp = ip2Int("101.46.1.200", 0);
+        int startIp = ip2Int("36.6.27.0", 0);
+        int endIp = ip2Int("36.192.160.255", 0);
         while (isLegalIp(startIp, endIp)) {
             String ip = intToIpv4(startIp);
             int nextIp = ip2Int(ip, 1);
             AreaIsp areaIsp = ipHelper.queryIp(ip);
+            // 查询完成后立即推进，保证空结果和非安徽结果不会让循环停留在同一个候选地址。
+            startIp = nextIp;
             if (Objects.isNull(areaIsp)) {
-                startIp = nextIp;
                 continue;
             }
             StringBuilder buffer = new StringBuilder();
@@ -40,7 +56,6 @@ public class IpLoopTest {
             buffer.append(",");
             buffer.append(areaIsp.getIsp());
             buffer.append("\n");
-            startIp = nextIp;
             System.out.println(buffer);
             all.append(buffer);
         }
@@ -50,6 +65,13 @@ public class IpLoopTest {
         Files.write(file.toPath(), all.toString().getBytes());
     }
 
+    /**
+     * 判断当前无符号 IPv4 数值是否仍未超过结束地址。
+     *
+     * @param startIp 当前 IPv4 的 32 位整数表示
+     * @param endIp   结束 IPv4 的 32 位整数表示
+     * @return 当前地址未超过结束地址时返回 {@code true}
+     */
     static boolean isLegalIp(int startIp, int endIp) {
         long s = Integer.toUnsignedLong(startIp);
         long e = Integer.toUnsignedLong(endIp);
@@ -62,6 +84,7 @@ public class IpLoopTest {
      * 思路就是将 ip 的每一段数字转为 8 位二进制数，并将它们放在结果的适当位置上
      *
      * @param ipString ip字符串，如 127.0.0.1
+     * @param add      需要增加的 {@code /24} 网段数量；大于 0 时作用于第三段
      * @return ip字符串对应的 int 值
      */
     public static int ip2Int(String ipString, int add) {
@@ -74,10 +97,10 @@ public class IpLoopTest {
         if (add > 0) {
             ip3 += add;
             if (ip3 > 255) {
-                ip3 -= 255;
+                ip3 -= 256;
                 ip2 += 1;
                 if (ip2 > 255) {
-                    ip2 -= 255;
+                    ip2 -= 256;
                     ip1 += 1;
                 }
             }
