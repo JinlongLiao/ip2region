@@ -9,21 +9,27 @@ package xdb
 import (
 	"container/list"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 type Editor struct {
+	verison *Version
+
 	// source ip file
-	srcPath   string
-	srcHandle *os.File
+	srcHandle io.ReadCloser
 	toSave    bool
 
 	// segments list
 	segments *list.List
+
+	// region cache
+	rgCache *RegionCache
 }
 
-func NewEditor(srcFile string) (*Editor, error) {
+func NewEditor(version *Version, srcFile string) (*Editor, error) {
 	// check the src and dst file
 	srcPath, err := filepath.Abs(srcFile)
 	if err != nil {
@@ -35,34 +41,58 @@ func NewEditor(srcFile string) (*Editor, error) {
 		return nil, err
 	}
 
+	return INewEditor(version, srcHandle)
+}
+
+func INewEditor(version *Version, srcReader io.ReadCloser) (*Editor, error) {
 	e := &Editor{
-		srcPath:   srcPath,
-		srcHandle: srcHandle,
+		verison:   version,
+		srcHandle: srcReader,
 		toSave:    false,
 		segments:  list.New(),
+		rgCache:   NewRegionCache(),
 	}
 
 	// load the segments
-	if err = e.loadSegments(); err != nil {
-		return nil, fmt.Errorf("failed to load segments: %s", err)
+	if srcReader != nil {
+		err := e.loadSegments()
+		if err != nil {
+			return nil, fmt.Errorf("failed to load segments: %s", err)
+		}
 	}
 
 	return e, nil
 }
 
+func (e *Editor) Region(str string) *Region {
+	return e.rgCache.Region(str)
+}
+
 // Load all the segments from the source file
 func (e *Editor) loadSegments() error {
 	var last *Segment = nil
+	var segments []*Segment
+	var sorting = false
 
-	var iErr = IterateSegments(e.srcHandle, func(l string) {
+	_, _, iErr := IterateSegments(e.srcHandle, true, func(l string) {
 		// do nothing here
-	}, func(seg *Segment) error {
-		// check the continuity of the data segment
-		if err := seg.AfterCheck(last); err != nil {
-			return err
+	}, nil, e.Region, func(seg *Segment) error {
+		// version check
+		if len(seg.StartIP) != e.verison.Bytes {
+			return fmt.Errorf("invalid ip segment(%s expected)", e.verison.Name)
 		}
 
-		e.segments.PushBack(seg)
+		// check the order of the data segment
+		// if err := seg.RightBehind(last); err != nil {
+		if err := seg.After(last); err != nil {
+			// return err
+			// @Note: If the continuity is disrupted,
+			// we will sort all these segments later.
+			sorting = true
+		}
+
+		// e.segments.PushBack(seg)
+		segments = append(segments, seg)
 		last = seg
 		return nil
 	})
@@ -70,6 +100,61 @@ func (e *Editor) loadSegments() error {
 		return iErr
 	}
 
+	// check and do the sorting
+	if sorting {
+		sort.Slice(segments, func(i, j int) bool {
+			return IPCompare(segments[i].StartIP, segments[j].StartIP) < 0
+		})
+
+		// open the to save
+		e.toSave = true
+	}
+
+	// check and fill in the discontinuous segments
+	// to Keep the entire data continuous.
+	last = nil
+	for _, seg := range segments {
+		if last == nil {
+			if IPCompare(seg.StartIP, e.verison.Min) > 0 {
+				e.segments.PushBack(&Segment{
+					StartIP: e.verison.Min,
+					EndIP:   IPSubOne(seg.StartIP),
+					Region:  EmptyRegion,
+				})
+			}
+		} else if err := seg.RightBehind(last); err == nil {
+			// Do nothing here since it just right behind the last
+		} else if err := seg.After(last); err != nil {
+			// segments overlap
+			return fmt.Errorf("overlap checking: %w", err)
+		} else {
+			// push the padding segments
+			e.segments.PushBack(&Segment{
+				StartIP: IPAddOne(last.EndIP),
+				EndIP:   IPSubOne(seg.StartIP),
+				Region:  EmptyRegion,
+			})
+		}
+
+		// push the current segment
+		e.segments.PushBack(seg)
+
+		// reset the last
+		last = seg
+	}
+
+	// check and padding the tailing segmnet
+	if back := e.segments.Back(); back != nil {
+		if IPCompare(e.verison.Max, back.Value.(*Segment).EndIP) > 0 {
+			e.segments.PushBack(&Segment{
+				StartIP: IPAddOne(back.Value.(*Segment).EndIP),
+				EndIP:   e.verison.Max,
+				Region:  EmptyRegion,
+			})
+		}
+	}
+
+	segments = nil // let GC do it work
 	return nil
 }
 
@@ -107,93 +192,101 @@ func (e *Editor) Slice(offset int, size int) []*Segment {
 	return out
 }
 
-func (e *Editor) Put(ip string) (int, int, error) {
-	seg, err := SegmentFrom(ip)
+func (e *Editor) Put(ip string, cb func(newSeg *Segment, oldList []*Segment) []*Segment) (int, int, error) {
+	seg, err := SegmentFrom(ip, e.rgCache.Region)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	return e.PutSegment(seg)
+	return e.PutSegment(seg, cb)
 }
 
 // PutSegment put the specified segment into the current segment list with
 // the following position relationships.
 // 1, A - fully contained like:
 // StartIP------seg.StartIP--------seg.EndIP----EndIP
-//                 |------------------|
+//
+//	|------------------|
+//
 // 2, B - intersect like:
 // StartIP------seg.StartIP------EndIP------|
-//                 |---------------------seg.EndIP
 //
-func (e *Editor) PutSegment(seg *Segment) (int, int, error) {
+//	|---------------------seg.EndIP
+func (e *Editor) PutSegment(seg *Segment, cb func(newSeg *Segment, oldList []*Segment) []*Segment) (int, int, error) {
 	var next *list.Element
 	var eList []*list.Element
-	var found = false
+	var found, counter = false, 0
 	for ele := e.segments.Front(); ele != nil; ele = next {
 		next = ele.Next()
 		s, ok := ele.Value.(*Segment)
 		if !ok {
 			// could this even be a case ?
-			continue
+			return 0, 0, fmt.Errorf("type error: ele not a Segment ptr")
 		}
+
+		counter++
 
 		// found the related segment
-		if seg.StartIP <= s.EndIP && seg.StartIP >= s.StartIP {
+		if found {
+			// just keep going
+		} else if IPCompare(seg.StartIP, s.StartIP) >= 0 &&
+			IPCompare(seg.StartIP, s.EndIP) <= 0 {
 			found = true
-		}
-
-		if found == false {
+		} else {
 			continue
 		}
 
 		eList = append(eList, ele)
-		if seg.EndIP <= s.EndIP {
+		if IPCompare(seg.EndIP, s.EndIP) <= 0 {
 			break
 		}
 	}
 
 	if len(eList) == 0 {
 		// could this even be a case ?
-		// if the loaded segments contains all the segments we have
-		// from 0 to 0xffffffff
-		return 0, 0, fmt.Errorf("failed to find the related segment")
+		// return 0, 0, fmt.Errorf("failed to find the related segment")
+
+		e.segments.PushBack(seg)
+		return 0, 1, nil
 	}
 
 	// print for debug
 	// for i, s := range eList {
-	// 	fmt.Printf("ele %d: %s\n", i, s.Value.(*Segment))
+	// 	fmt.Printf("find -> %d: %s\n", i, s.Value.(*Segment))
 	// }
 
 	// segment split
 	var sList []*Segment
 	var head = eList[0].Value.(*Segment)
-	if seg.StartIP > head.StartIP {
+	if IPCompare(seg.StartIP, head.StartIP) > 0 {
 		sList = append(sList, &Segment{
 			StartIP: head.StartIP,
-			EndIP:   seg.StartIP - 1,
+			EndIP:   IPSubOne(seg.StartIP),
 			Region:  head.Region,
 		})
 	}
 
-	// append the new segment
-	sList = append(sList, seg)
+	// check the callback and append the new segment
+	if cb == nil {
+		sList = append(sList, seg)
+	} else {
+		// call the callback and append the segments
+		sList = append(sList, cb(seg, e._getSegments(seg, eList))...)
+	}
 
 	// check and do the tailing segment append
-	if len(sList) > 0 {
-		// check and append the tailing
-		var tail = eList[len(eList)-1].Value.(*Segment)
-		if seg.EndIP < tail.EndIP {
-			sList = append(sList, &Segment{
-				StartIP: seg.EndIP + 1,
-				EndIP:   tail.EndIP,
-				Region:  tail.Region,
-			})
-		}
+	var tail = eList[len(eList)-1].Value.(*Segment)
+	if IPCompare(seg.EndIP, tail.EndIP) < 0 {
+		sList = append(sList, &Segment{
+			StartIP: IPAddOne(seg.EndIP),
+			EndIP:   tail.EndIP,
+			Region:  tail.Region,
+		})
 	}
 
 	// print for debug
 	// for i, s := range sList {
-	// 	fmt.Printf("%d: %s\n", i, s)
+	// 	fmt.Printf("replace -> %d: %s\n", i, s)
 	// }
 
 	// delete all the in-range segments and
@@ -221,17 +314,58 @@ func (e *Editor) PutSegment(seg *Segment) (int, int, error) {
 	return oldRows, newRows, nil
 }
 
-func (e *Editor) PutFile(src string) (int, int, error) {
+func (e *Editor) _getSegments(seg *Segment, eList []*list.Element) []*Segment {
+	var sList []*Segment
+	var eLen = len(eList)
+	switch eLen {
+	case 0:
+		return sList
+	case 1:
+		fSeg := eList[0].Value.(*Segment)
+		return append(sList, &Segment{
+			StartIP: seg.StartIP,
+			EndIP:   seg.EndIP,
+			Region:  fSeg.Region,
+		})
+	}
+
+	var maxIdx = eLen - 1
+
+	// append the first segment
+	fSeg := eList[0].Value.(*Segment)
+	sList = append(sList, &Segment{
+		StartIP: seg.StartIP,
+		EndIP:   fSeg.EndIP,
+		Region:  fSeg.Region,
+	})
+
+	// append the middle segments
+	for i := 1; i < maxIdx; i++ {
+		sList = append(sList, eList[i].Value.(*Segment))
+	}
+
+	// append the last segment
+	lSeg := eList[maxIdx].Value.(*Segment)
+	sList = append(sList, &Segment{
+		StartIP: lSeg.StartIP,
+		EndIP:   seg.EndIP,
+		Region:  lSeg.Region,
+	})
+
+	return sList
+}
+
+func (e *Editor) PutFile(src string, cb func(newSeg *Segment, oldList []*Segment) []*Segment) (int, int, error) {
 	handle, err := os.OpenFile(src, os.O_RDONLY, 0600)
 	if err != nil {
 		return 0, 0, err
 	}
 
 	var oldRows, newRows = 0, 0
-	iErr := IterateSegments(handle, func(l string) {
+	_, _, iErr := IterateSegments(handle, true, func(l string) {
 		// do nothing here
-	}, func(seg *Segment) error {
-		o, n, err := e.PutSegment(seg)
+	}, nil, NewRegion, func(seg *Segment) error {
+		o, n, err := e.PutSegment(seg, cb)
 		if err == nil {
 			oldRows += o
 			newRows += n
@@ -247,16 +381,17 @@ func (e *Editor) PutFile(src string) (int, int, error) {
 	return oldRows, newRows, nil
 }
 
-func (e *Editor) Save() error {
+func (e *Editor) SaveToFile(dstFile string) error {
 	// check the to-save flag
-	if e.toSave == false {
+	if !e.toSave {
 		return fmt.Errorf("nothing changed")
 	}
 
-	dstHandle, err := os.OpenFile(e.srcPath, os.O_WRONLY|os.O_TRUNC, 0644)
+	dstHandle, err := os.OpenFile(dstFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
+	defer dstHandle.Close()
 
 	// loop and flush all the segments to the dstHandle
 	var next *list.Element
@@ -268,16 +403,20 @@ func (e *Editor) Save() error {
 			continue
 		}
 
-		var l = s.String()
-		_, err = dstHandle.WriteString(fmt.Sprintf("%s\n", l))
+		// ignore the padded or empty segment
+		if s.Region.IsEmpty() {
+			continue
+		}
+
+		// var l = s.String()
+		// _, err = dstHandle.WriteString(fmt.Sprintf("%s\n", l))
+		_, err = fmt.Fprintln(dstHandle, s.String())
 		if err != nil {
 			return err
 		}
 	}
 
-	// close the handle
-	// and close the to-save flag
-	_ = dstHandle.Close()
+	// close the to-save flag
 	e.toSave = false
 
 	return nil
@@ -285,4 +424,5 @@ func (e *Editor) Save() error {
 
 func (e *Editor) Close() {
 	_ = e.srcHandle.Close()
+	e.rgCache.Clean()
 }

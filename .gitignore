@@ -6,7 +6,6 @@
 *.log
 *.la
 *.so
-*.xdb
 *.iml
 META-INF/
 .DS_Store
@@ -28,20 +27,20 @@ META-INF/
 *.swp
 .idea
 .codegraph/
+.vscode
 
 # binding
-/v1.0//binding/java/classes/
-/v1.0//binding/java/doc/
-/v1.0//binding/java/target/
-/v1.0//binding/java/*.jar
 /binding/java/classes/
 /binding/java/doc/
 /binding/java/target/
 /binding/java/*.jar
 
+# python
+/**/__pycache__
+
 # clang
 /binding/c/xdb_searcher
-/binding/c/util_test
+/binding/c/test_util
 /binding/c/cmake-build-debug
 
 # lua/luc_c
@@ -59,23 +58,24 @@ target
 
 # VS ignore cases
 /**/*.sln
-/v1.0/binding/c#/**/.vs/
-/v1.0/binding/c#/**/packages
-/v1.0/binding/c#/**/bin
-/v1.0/binding/c#/**/obj
 /binding/c#/**/.vs/
 /binding/c#/**/packages
 /binding/c#/**/bin
 /binding/c#/**/obj
 
 # Nodejs
-/v1.0/binding/nodejs/tests/unitTests/__snapshots__
-/v1.0/binding/nodejs/coverage
 /binding/nodejs/tests/unitTests/__snapshots__
 /binding/nodejs/coverage
 /binding/nodejs/node_modules
 /binding/nodejs/.nyc_output
 /binging/nodejs/package-lock.json
+
+# Javascript
+/binding/javascript/tests/unitTests/__snapshots__
+/binding/javascript/coverage
+/binding/javascript/node_modules
+/binding/javascript/.nyc_output
+/binding/javascript/package-lock.json
 
 # maker
 ## golang
@@ -90,3 +90,9 @@ target
 #vscode
 .vscode
 build
+
+# git worktrees
+.worktrees/
+
+# 项目级地区代码规则必须随源码交付，覆盖个人全局 *.json 忽略规则。
+!/scripts/data/国家名称代码映射.json

@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // ----
-// ip2region database v2.0 structure
+// Ip2Region database v2.0 structure
 //
 // +----------------+-------------------+---------------+--------------+
 // | header space   | speed up index    |  data payload | block index  |
@@ -12,16 +12,19 @@
 // +----------------+-------------------+---------------+--------------+
 //
 // 1. padding space : for header info like block index ptr, version, release date eg ... or any other temporary needs.
-// -- 2bytes: version number, different version means structure update, it fixed to 2 for now
+// -- 2bytes: version number, different version means structure update,
+//			it fixed to 2 before IPv6 supporting, then updated to 3 since IPv6 supporting
 // -- 2bytes: index algorithm code.
 // -- 4bytes: generate unix timestamp (version)
 // -- 4bytes: index block start ptr
 // -- 4bytes: index block end ptr
+// -- 2bytes: ip version number (4/6 since IPv6 supporting)
+// -- 2bytes: runtime ptr bytes
 //
 //
-// 2. data block : region or whatever data info.
-// 3. segment index block : binary index block.
-// 4. vector index block  : fixed index info for block index search speed up.
+// 2. data block: region or whatever data info.
+// 3. segment index block: binary index block.
+// 4. vector index block: fixed index info for block index search speedup.
 // space structure table:
 // -- 0   -> | 1rt super block | 2nd super block | 3rd super block | ... | 255th super block
 // -- 1   -> | 1rt super block | 2nd super block | 3rd super block | ... | 255th super block
@@ -52,34 +55,57 @@ package xdb
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
+	"math"
 	"os"
+	"sort"
 	"time"
 )
 
-const VersionNo = 2
-const HeaderInfoLength = 256
-const VectorIndexRows = 256
-const VectorIndexCols = 256
-const VectorIndexSize = 8
-const SegmentIndexSize = 14
-const VectorIndexLength = VectorIndexRows * VectorIndexCols * VectorIndexSize
+const (
+	VersionNo         = 3 // since 2025/09/01 (IPv6 supporting)
+	HeaderInfoLength  = 256
+	VectorIndexRows   = 256
+	VectorIndexCols   = 256
+	VectorIndexSize   = 8 // in bytes
+	RuntimePtrSize    = 4 // in bytes
+	VectorIndexLength = VectorIndexRows * VectorIndexCols * VectorIndexSize
+)
+
+type WriteSeekCloser interface {
+	io.Writer
+	io.Seeker
+	io.Closer
+}
 
 type Maker struct {
-	srcHandle *os.File
-	dstHandle *os.File
+	version *Version
+
+	srcReader io.ReadCloser
+	dstWriter WriteSeekCloser
+
+	// self-define field index
+	fields []int
 
 	indexPolicy IndexPolicy
 	segments    []*Segment
 	regionPool  map[string]uint32
+	regionCache *RegionCache
 	vectorIndex []byte
 }
 
-func NewMaker(policy IndexPolicy, srcFile string, dstFile string) (*Maker, error) {
+func NewMaker(version *Version, policy IndexPolicy, srcFile string, dstFile string, fields []int) (*Maker, error) {
 	// open the source file with READONLY mode
-	srcHandle, err := os.OpenFile(srcFile, os.O_RDONLY, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("open source file `%s`: %w", srcFile, err)
+	var err error
+	var srcHandle *os.File
+	if srcFile == "" {
+		srcHandle = nil
+	} else {
+		srcHandle, err = os.OpenFile(srcFile, os.O_RDONLY, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("open source file `%s`: %w", srcFile, err)
+		}
 	}
 
 	// open the destination file with Read/Write mode
@@ -88,21 +114,31 @@ func NewMaker(policy IndexPolicy, srcFile string, dstFile string) (*Maker, error
 		return nil, fmt.Errorf("open target file `%s`: %w", dstFile, err)
 	}
 
+	return INewMaker(version, policy, srcHandle, dstHandle, fields), nil
+}
+
+func INewMaker(version *Version, policy IndexPolicy, srcReader io.ReadCloser, dstWriter WriteSeekCloser, fields []int) *Maker {
 	return &Maker{
-		srcHandle: srcHandle,
-		dstHandle: dstHandle,
+		version: version,
+
+		srcReader: srcReader,
+		dstWriter: dstWriter,
+
+		// fields filter index
+		fields: fields,
 
 		indexPolicy: policy,
 		segments:    []*Segment{},
 		regionPool:  map[string]uint32{},
+		regionCache: NewRegionCache(),
 		vectorIndex: make([]byte, VectorIndexLength),
-	}, nil
+	}
 }
 
 func (m *Maker) initDbHeader() error {
-	log.Printf("try to init the db header ... ")
+	slog.Info("try to init the db header ... ")
 
-	_, err := m.dstHandle.Seek(0, 0)
+	_, err := m.dstWriter.Seek(0, 0)
 	if err != nil {
 		return err
 	}
@@ -110,7 +146,7 @@ func (m *Maker) initDbHeader() error {
 	// make and write the header space
 	var header = make([]byte, 256)
 
-	// 1, version number
+	// 1, data version number
 	binary.LittleEndian.PutUint16(header, uint16(VersionNo))
 
 	// 2, index policy code
@@ -125,7 +161,13 @@ func (m *Maker) initDbHeader() error {
 	// 5, index block end ptr
 	binary.LittleEndian.PutUint32(header[12:], uint32(0))
 
-	_, err = m.dstHandle.Write(header)
+	// 6, ip version
+	binary.LittleEndian.PutUint16(header[16:], uint16(m.version.Id))
+
+	// 7, runtime ptr bytes
+	binary.LittleEndian.PutUint16(header[18:], uint16(RuntimePtrSize))
+
+	_, err = m.dstWriter.Write(header)
 	if err != nil {
 		return err
 	}
@@ -134,16 +176,30 @@ func (m *Maker) initDbHeader() error {
 }
 
 func (m *Maker) loadSegments() error {
-	log.Printf("try to load the segments ... ")
+	slog.Info("try to load the segments ... ")
 	var last *Segment = nil
 	var tStart = time.Now()
+	var sorting = false
 
-	var iErr = IterateSegments(m.srcHandle, func(l string) {
-		log.Printf("load segment: `%s`", l)
-	}, func(seg *Segment) error {
-		// check the continuity of the data segment
-		if err := seg.AfterCheck(last); err != nil {
-			return err
+	_, mergeCount, iErr := IterateSegments(m.srcReader, true, func(l string) {
+		slog.Debug("loaded", "segment", l)
+	}, func(region string) (string, error) {
+		// apply the field filter
+		return RegionFiltering(region, m.fields)
+	}, m.regionCache.Region, func(seg *Segment) error {
+		// ip version check
+		if len(seg.StartIP) != m.version.Bytes {
+			return fmt.Errorf("invalid ip segment(%s expected)", m.version.Name)
+		}
+
+		// check the order of the data segment
+		if sorting {
+			// just keep going
+		} else if err := seg.After(last); err != nil {
+			// return err
+			// @Note: If the continuity is disrupted,
+			// we will sort all these segments later.
+			sorting = true
 		}
 
 		m.segments = append(m.segments, seg)
@@ -154,7 +210,27 @@ func (m *Maker) loadSegments() error {
 		return fmt.Errorf("failed to load segments: %s", iErr)
 	}
 
-	log.Printf("all segments loaded, length: %d, elapsed: %s", len(m.segments), time.Since(tStart))
+	// check and do the sorting
+	if sorting {
+		slog.Info("try to sort all the segments based on its start ip ...")
+		sort.Slice(m.segments, func(i, j int) bool {
+			return IPCompare(m.segments[i].StartIP, m.segments[j].StartIP) < 0
+		})
+
+		slog.Info("try to check if there is overlap in the segments  ...")
+		last = nil
+		for _, seg := range m.segments {
+			// check the order of the data segment
+			if err := seg.After(last); err != nil {
+				return fmt.Errorf("overlap checking: %w", err)
+			}
+
+			// reset the last
+			last = seg
+		}
+	}
+
+	slog.Info("all segments loaded", "length", len(m.segments), "merged", mergeCount, "sorting", sorting, "elapsed", time.Since(tStart))
 	return nil
 }
 
@@ -167,25 +243,32 @@ func (m *Maker) Init() error {
 	}
 
 	// load all the segments
-	err = m.loadSegments()
-	if err != nil {
-		return fmt.Errorf("load segments: %w", err)
+	if m.srcReader != nil {
+		err = m.loadSegments()
+		if err != nil {
+			return fmt.Errorf("load segments: %w", err)
+		}
 	}
 
 	return nil
 }
 
+// Append a new segment
+func (m *Maker) Append(seg *Segment) {
+	m.segments = append(m.segments, seg)
+}
+
 // refresh the vector index of the specified ip
-func (m *Maker) setVectorIndex(ip uint32, ptr uint32) {
-	var il0 = (ip >> 24) & 0xFF
-	var il1 = (ip >> 16) & 0xFF
+func (m *Maker) setVectorIndex(ip []byte, ptr uint32) {
+	var segIdxSize = uint32(m.version.SegmentIndexSize)
+	var il0, il1 = int(ip[0]), int(ip[1])
 	var idx = il0*VectorIndexCols*VectorIndexSize + il1*VectorIndexSize
 	var sPtr = binary.LittleEndian.Uint32(m.vectorIndex[idx:])
 	if sPtr == 0 {
 		binary.LittleEndian.PutUint32(m.vectorIndex[idx:], ptr)
-		binary.LittleEndian.PutUint32(m.vectorIndex[idx+4:], ptr+SegmentIndexSize)
+		binary.LittleEndian.PutUint32(m.vectorIndex[idx+4:], ptr+segIdxSize)
 	} else {
-		binary.LittleEndian.PutUint32(m.vectorIndex[idx+4:], ptr+SegmentIndexSize)
+		binary.LittleEndian.PutUint32(m.vectorIndex[idx+4:], ptr+segIdxSize)
 	}
 }
 
@@ -196,77 +279,96 @@ func (m *Maker) Start() error {
 	}
 
 	// 1, write all the region/data to the binary file
-	_, err := m.dstHandle.Seek(int64(HeaderInfoLength+VectorIndexLength), 0)
+	_, err := m.dstWriter.Seek(int64(HeaderInfoLength+VectorIndexLength), 0)
 	if err != nil {
 		return fmt.Errorf("seek to data first ptr: %w", err)
 	}
 
-	log.Printf("try to write the data block ... ")
+	slog.Info("try to write the data block ... ")
 	for _, seg := range m.segments {
-		log.Printf("try to write region '%s' ... ", seg.Region)
-		ptr, has := m.regionPool[seg.Region]
+		slog.Debug("try to write", "region", seg.Region)
+		ptr, has := m.regionPool[seg.Region.Str]
 		if has {
-			log.Printf(" --[Cached] with ptr=%d", ptr)
+			slog.Debug(" --[Cached]", "ptr=", ptr)
 			continue
 		}
 
-		var region = []byte(seg.Region)
+		var region = []byte(seg.Region.Str)
 		if len(region) > 0xFFFF {
 			return fmt.Errorf("too long region info `%s`: should be less than %d bytes", seg.Region, 0xFFFF)
 		}
 
 		// get the first ptr of the next region
-		pos, err := m.dstHandle.Seek(0, 1)
+		pos, err := m.dstWriter.Seek(0, 1)
 		if err != nil {
 			return fmt.Errorf("seek to current ptr: %w", err)
 		}
 
-		_, err = m.dstHandle.Write(region)
+		// @TODO: remove this if the long ptr operation were supported
+		if pos >= math.MaxUint32 {
+			return fmt.Errorf("region ptr exceed the max length of %d", math.MaxUint32)
+		}
+
+		_, err = m.dstWriter.Write(region)
 		if err != nil {
 			return fmt.Errorf("write region '%s': %w", seg.Region, err)
 		}
 
-		m.regionPool[seg.Region] = uint32(pos)
-		log.Printf(" --[Added] with ptr=%d", pos)
+		m.regionPool[seg.Region.Str] = uint32(pos)
+		slog.Debug(" --[Added] with", "ptr", pos)
 	}
 
 	// 2, write the index block and cache the super index block
-	log.Printf("try to write the segment index block ... ")
-	var indexBuff = make([]byte, SegmentIndexSize)
+	slog.Info("try to write the segment index block ... ")
+	var indexBuff = make([]byte, m.version.SegmentIndexSize)
 	var counter, startIndexPtr, endIndexPtr = 0, int64(-1), int64(-1)
 	for _, seg := range m.segments {
-		dataPtr, has := m.regionPool[seg.Region]
+		dataPtr, has := m.regionPool[seg.Region.Str]
 		if !has {
 			return fmt.Errorf("missing ptr cache for region `%s`", seg.Region)
 		}
 
 		// @Note: data length should be the length of bytes.
-		// this works find cuz of the string feature (byte sequence) of golang.
-		var dataLen = len(seg.Region)
+		// this works fine because of the string feature (byte sequence) of golang.
+		var dataLen = len(seg.Region.Str)
 		if dataLen < 1 {
 			// @TODO: could this even be a case ?
-			return fmt.Errorf("empty region info for segment '%s'", seg)
+			// 	return fmt.Errorf("empty region info for segment '%s'", seg)
+			// Allow empty region info since 2024/09/24
 		}
 
+		var _offset = 0
 		var segList = seg.Split()
-		log.Printf("try to index segment(%d splits) %s ...", len(segList), seg.String())
+		slog.Debug("try to index segment", "length", len(segList), "splits", seg.String())
 		for _, s := range segList {
-			pos, err := m.dstHandle.Seek(0, 1)
+			pos, err := m.dstWriter.Seek(0, 1)
 			if err != nil {
 				return fmt.Errorf("seek to segment index block: %w", err)
 			}
 
-			// encode the segment index
-			binary.LittleEndian.PutUint32(indexBuff, s.StartIP)
-			binary.LittleEndian.PutUint32(indexBuff[4:], s.EndIP)
-			binary.LittleEndian.PutUint16(indexBuff[8:], uint16(dataLen))
-			binary.LittleEndian.PutUint32(indexBuff[10:], dataPtr)
-			_, err = m.dstHandle.Write(indexBuff)
+			// @TODO: remove this if the long ptr operation were supported
+			if pos >= math.MaxUint32 {
+				return fmt.Errorf("segment index ptr exceed the max length of %d", math.MaxUint32)
+			}
+
+			// encode the segment index.
+			// @Note by Leon at 2025/09/05:
+			// This is a tough decision since the directly copy of the bytes will make everything simpler.
+			// But in order to compatible with the old searcher implementation we had to keep encoding the IPv4 bytes with little endian.
+			// @TODO: we may choose to use the big-endian byte order in the future.
+			// But now compatibility is the most important !!!
+
+			m.version.PutBytes(indexBuff[0:], s.StartIP)
+			m.version.PutBytes(indexBuff[len(s.StartIP):], s.EndIP)
+			_offset = len(s.StartIP) + len(s.EndIP)
+			binary.LittleEndian.PutUint16(indexBuff[_offset:], uint16(dataLen))
+			binary.LittleEndian.PutUint32(indexBuff[_offset+2:], dataPtr)
+			_, err = m.dstWriter.Write(indexBuff)
 			if err != nil {
 				return fmt.Errorf("write segment index for '%s': %w", s.String(), err)
 			}
 
-			log.Printf("|-segment index: %d, ptr: %d, segment: %s\n", counter, pos, s.String())
+			slog.Debug("|-segment index", "counter", counter, "ptr", pos, "segment", s.String())
 			m.setVectorIndex(s.StartIP, uint32(pos))
 			counter++
 
@@ -280,46 +382,48 @@ func (m *Maker) Start() error {
 	}
 
 	// synchronized the vector index block
-	log.Printf("try to write the vector index block ... ")
-	_, err = m.dstHandle.Seek(int64(HeaderInfoLength), 0)
+	slog.Info("try to write the vector index block ... ")
+	_, err = m.dstWriter.Seek(int64(HeaderInfoLength), 0)
 	if err != nil {
 		return fmt.Errorf("seek vector index first ptr: %w", err)
 	}
-	_, err = m.dstHandle.Write(m.vectorIndex)
+	_, err = m.dstWriter.Write(m.vectorIndex)
 	if err != nil {
 		return fmt.Errorf("write vector index: %w", err)
 	}
 
 	// synchronized the segment index info
-	log.Printf("try to write the segment index ptr ... ")
+	slog.Info("try to write the segment index ptr ... ")
 	binary.LittleEndian.PutUint32(indexBuff, uint32(startIndexPtr))
 	binary.LittleEndian.PutUint32(indexBuff[4:], uint32(endIndexPtr))
-	_, err = m.dstHandle.Seek(8, 0)
+	_, err = m.dstWriter.Seek(8, 0)
 	if err != nil {
 		return fmt.Errorf("seek segment index ptr: %w", err)
 	}
 
-	_, err = m.dstHandle.Write(indexBuff[:8])
+	_, err = m.dstWriter.Write(indexBuff[:8])
 	if err != nil {
 		return fmt.Errorf("write segment index ptr: %w", err)
 	}
 
-	log.Printf("write done, dataBlocks: %d, indexBlocks: (%d, %d), indexPtr: (%d, %d)",
-		len(m.regionPool), len(m.segments), counter, startIndexPtr, endIndexPtr)
+	slog.Info("write done", "dataBlocks", len(m.regionPool), "indexBlocks", len(m.segments),
+		"counter", counter, "startIndexPtr", startIndexPtr, "endIndexPtr", endIndexPtr)
 
 	return nil
 }
 
 func (m *Maker) End() error {
-	err := m.dstHandle.Close()
+	err := m.dstWriter.Close()
 	if err != nil {
 		return err
 	}
 
-	err = m.srcHandle.Close()
+	err = m.srcReader.Close()
 	if err != nil {
 		return err
 	}
+
+	m.regionCache.Clean()
 
 	return nil
 }

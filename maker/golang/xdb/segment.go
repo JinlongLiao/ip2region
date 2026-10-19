@@ -10,45 +10,97 @@ import (
 )
 
 type Segment struct {
-	StartIP uint32
-	EndIP   uint32
-	Region  string
+	StartIP []byte
+	EndIP   []byte
+	Region  *Region
 }
 
-func SegmentFrom(seg string) (*Segment, error) {
-	var ps = strings.SplitN(strings.TrimSpace(seg), "|", 3)
-	if len(ps) != 3 {
-		return nil, fmt.Errorf("invalid ip segment `%s`", seg)
+func ParseSegment(seg string, sep string) ([]byte, []byte, string, error) {
+	var count = 0
+	var ps = StringTokenizer(strings.TrimSpace(seg), sep, func(s string, start int) bool {
+		// CIDR format
+		if strings.Index(s, "/") > 0 {
+			return false
+		}
+
+		count++
+		return count < 2
+	})
+
+	var err error
+	var sip, eip []byte
+	var rIdx = 0
+	switch pl := len(ps); pl {
+	case 2:
+		// CIDR format
+		rIdx = 1
+		sip, eip, err = CIDR2Range(ps[0])
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("parse cidr: %s", err)
+		}
+	case 3:
+		// triditional ip range
+		rIdx = 2
+		sip, err = ParseIP(ps[0])
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("parse start ip `%s`: %s", ps[0], err)
+		}
+
+		eip, err = ParseIP(ps[1])
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("check end ip `%s`: %s", ps[1], err)
+		}
+	default:
+		return nil, nil, "", fmt.Errorf("invalid ip segment `%s`", seg)
 	}
 
-	sip, err := CheckIP(ps[0])
+	if len(sip) != len(eip) {
+		return nil, nil, "", fmt.Errorf("invalid ip segment line `%s`, sip/eip version not match", seg)
+	}
+
+	if IPCompare(sip, eip) > 0 {
+		return nil, nil, "", fmt.Errorf("start ip(%s) should not be greater than end ip(%s)", ps[0], ps[1])
+	}
+
+	return sip, eip, ps[rIdx], nil
+}
+
+func SegmentFrom(seg string, cRegion func(string) *Region) (*Segment, error) {
+	sip, eip, region, err := ParseSegment(seg, "|")
 	if err != nil {
-		return nil, fmt.Errorf("check start ip `%s`: %s", ps[0], err)
-	}
-
-	eip, err := CheckIP(ps[1])
-	if err != nil {
-		return nil, fmt.Errorf("check end ip `%s`: %s", ps[1], err)
-	}
-
-	if sip > eip {
-		return nil, fmt.Errorf("start ip(%s) should not be greater than end ip(%s)", ps[0], ps[1])
+		return nil, err
 	}
 
 	return &Segment{
 		StartIP: sip,
 		EndIP:   eip,
-		Region:  ps[2],
+		Region:  cRegion(region),
 	}, nil
 }
 
-// AfterCheck check the current segment is the one just after the specified one
-func (s *Segment) AfterCheck(last *Segment) error {
+// RightBehind check the current segment is just right behind the specified one
+// which mean last.EndIP + 1 = s.startIP
+func (s *Segment) RightBehind(last *Segment) error {
 	if last != nil {
-		if last.EndIP+1 != s.StartIP {
+		if IPCompare(IPAddOne(last.EndIP), s.StartIP) != 0 {
 			return fmt.Errorf(
-				"discontinuous data segment: last.eip+1(%d) != seg.sip(%d, %s)",
-				last.EndIP+1, s.StartIP, s.Region,
+				"discontinuous data segment: last.eip(%s)+1 != seg.sip(%s, %s)",
+				IP2String(last.EndIP), IP2String(s.StartIP), s.Region,
+			)
+		}
+	}
+
+	return nil
+}
+
+// After check the current segment is after the specified one
+// which means last.EndIP < s.startIP
+func (s *Segment) After(last *Segment) error {
+	if last != nil {
+		if IPCompare(last.EndIP, s.StartIP) >= 0 {
+			return fmt.Errorf(
+				"disorder data segment: last.eip(%s) >= seg.sip(%s, %s)",
+				IP2String(last.EndIP), IP2String(s.StartIP), s.Region,
 			)
 		}
 	}
@@ -60,17 +112,39 @@ func (s *Segment) AfterCheck(last *Segment) error {
 func (s *Segment) Split() []*Segment {
 	// 1, split the segment with the first byte
 	var tList []*Segment
-	var sByte1, eByte1 = (s.StartIP >> 24) & 0xFF, (s.EndIP >> 24) & 0xFF
-	var nSip = s.StartIP
+	var sByte1, eByte1 = int(s.StartIP[0]), int(s.EndIP[0])
+	// var nSip = s.StartIP
 	for i := sByte1; i <= eByte1; i++ {
-		sip := (i << 24) | (nSip & 0xFFFFFF)
-		eip := (i << 24) | 0xFFFFFF
-		if eip < s.EndIP {
-			nSip = (i + 1) << 24
+		// Make and init the new start & end IP
+		sip := make([]byte, len(s.StartIP))
+		eip := make([]byte, len(s.StartIP))
+
+		if i == sByte1 {
+			sip = s.StartIP
 		} else {
-			eip = s.EndIP
+			sip[0] = byte(i)
 		}
 
+		if i == eByte1 {
+			eip = s.EndIP
+		} else {
+			// set the first byte
+			eip[0] = byte(i)
+			// fill the buffer with 0xFF
+			for j := 1; j < len(eip); j++ {
+				eip[j] = 0xFF
+			}
+		}
+
+		// sip := (i << 24) | (nSip & 0xFFFFFF)
+		// eip := (i << 24) | 0xFFFFFF
+		// if eip < s.EndIP {
+		// 	nSip = (i + 1) << 24
+		// } else {
+		// 	eip = s.EndIP
+		// }
+
+		// fmt.Printf("sip:%+v, eip: %+v\n", sip, eip)
 		// append the new segment (maybe)
 		tList = append(tList, &Segment{
 			StartIP: sip,
@@ -83,18 +157,41 @@ func (s *Segment) Split() []*Segment {
 	// 2, split the segments with the second byte
 	var segList []*Segment
 	for _, seg := range tList {
-		base := seg.StartIP & 0xFF000000
-		nSip := seg.StartIP
-		sb2, eb2 := (seg.StartIP>>16)&0xFF, (seg.EndIP>>16)&0xFF
+		// base := seg.StartIP & 0xFF000000
+		// nSip := seg.StartIP
+		// sb2, eb2 := (seg.StartIP>>16)&0xFF, (seg.EndIP>>16)&0xFF
+		sb2, eb2 := int(seg.StartIP[1]), int(seg.EndIP[1])
+		// fmt.Printf("seg: %s, sb2: %d, eb2: %d\n", seg.String(), sb2, eb2)
 		for i := sb2; i <= eb2; i++ {
-			sip := base | (i << 16) | (nSip & 0xFFFF)
-			eip := base | (i << 16) | 0xFFFF
-			if eip < seg.EndIP {
-				nSip = 0
+			// sip := base | (i << 16) | (nSip & 0xFFFF)
+			// eip := base | (i << 16) | 0xFFFF
+			// if eip < seg.EndIP {
+			// 	nSip = 0
+			// } else {
+			// 	eip = seg.EndIP
+			// }
+
+			sip := make([]byte, len(s.StartIP))
+			eip := make([]byte, len(s.StartIP))
+			sip[0] = seg.StartIP[0]
+			eip[0] = seg.StartIP[0]
+
+			if i == sb2 {
+				sip = seg.StartIP
 			} else {
-				eip = seg.EndIP
+				sip[1] = byte(i)
 			}
 
+			if i == eb2 {
+				eip = seg.EndIP
+			} else {
+				eip[1] = byte(i)
+				for j := 2; j < len(eip); j++ {
+					eip[j] = 0xFF
+				}
+			}
+
+			// fmt.Printf("i=%d, sip:%+v, eip: %+v\n", i, sip, eip)
 			segList = append(segList, &Segment{
 				StartIP: sip,
 				EndIP:   eip,
@@ -107,5 +204,10 @@ func (s *Segment) Split() []*Segment {
 }
 
 func (s *Segment) String() string {
-	return fmt.Sprintf("%s|%s|%s", Long2IP(s.StartIP), Long2IP(s.EndIP), s.Region)
+	return fmt.Sprintf("%s|%s|%s", IP2String(s.StartIP), IP2String(s.EndIP), s.Region)
+}
+
+// Contains checks if an IP address is within this segment
+func (s *Segment) Contains(ip []byte) bool {
+	return IPCompare(s.StartIP, ip) <= 0 && IPCompare(ip, s.EndIP) <= 0
 }

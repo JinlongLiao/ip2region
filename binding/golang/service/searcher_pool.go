@@ -1,0 +1,128 @@
+// Copyright 2022 The Ip2Region Authors. All rights reserved.
+// Use of this source code is governed by a Apache2.0-style
+// license that can be found in the LICENSE file.
+
+package service
+
+import (
+	"fmt"
+	"sync/atomic"
+	"time"
+
+	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
+)
+
+// ---
+// ip2region searcher pool
+//
+// @Author Lion <chenxin619315@gmail.com>
+// @Date   2025/12/03
+
+type SearcherPool struct {
+	// config
+	config *Config
+
+	// searcher pool
+	pool chan *xdb.Searcher
+
+	// for pool close
+	closing chan struct{}
+
+	// searcher number that was loaned out
+	loanCount int32
+}
+
+func NewSearcherPool(config *Config) (*SearcherPool, error) {
+	if config.searchers < 1 {
+		return nil, fmt.Errorf("config.searchers must > 0")
+	}
+
+	var eExit = false
+	var spObj = &SearcherPool{
+		config: config,
+		pool:   make(chan *xdb.Searcher, config.searchers+1),
+
+		closing:   make(chan struct{}, 1),
+		loanCount: 0,
+	}
+
+	// error closing
+	defer func() {
+		if eExit {
+			spObj.Close()
+		}
+	}()
+
+	// check and create all the searchers
+	for i := 0; i < config.searchers; i++ {
+		searcher, err := xdb.NewSearcher(config.ipVersion, config.xdbPath, config.vIndex, config.cBuffer)
+		if err != nil {
+			eExit = true // active the auto error closing
+			return nil, fmt.Errorf("failed to create the %dth searcher: %w", i+1, err)
+		}
+
+		// push the search to the pool
+		spObj.pool <- searcher
+	}
+
+	return spObj, nil
+}
+
+// get the loaned count
+func (sp *SearcherPool) LoanCount() int {
+	return int(atomic.LoadInt32(&sp.loanCount))
+}
+
+func (sp *SearcherPool) BorrowSearcher() *xdb.Searcher {
+	// @Note: still accept searcher borrow while closing,
+	// return nil directly once the pool was closed to avoid blocking forever.
+	select {
+	case <-sp.closing:
+		return nil
+	case s := <-sp.pool:
+		atomic.AddInt32(&sp.loanCount, 1)
+		return s
+	}
+}
+
+func (sp *SearcherPool) ReturnSearcher(searcher *xdb.Searcher) {
+	select {
+	case <-sp.closing:
+		// manually close the searcher
+		searcher.Close()
+
+		// decrease the loan count
+		atomic.AddInt32(&sp.loanCount, -1)
+	default:
+		// return the searcher
+		sp.pool <- searcher
+		atomic.AddInt32(&sp.loanCount, -1)
+	}
+}
+
+func (sp *SearcherPool) Close() {
+	sp.CloseTimeout(time.Second * 10)
+}
+
+func (sp *SearcherPool) CloseTimeout(d time.Duration) {
+	close(sp.closing)
+
+	// wait timeout
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	for {
+		// check if all the loaned searchers was closed
+		lc, left := sp.LoanCount(), len(sp.pool)
+		if lc == 0 && left == 0 {
+			break
+		}
+
+		select {
+		case s := <-sp.pool:
+			s.Close()
+		case <-timer.C:
+			return
+		}
+	}
+}

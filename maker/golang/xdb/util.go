@@ -6,50 +6,191 @@ package xdb
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
-	"os"
-	"strconv"
+	"io"
+	"math/big"
+	"net"
+	"net/netip"
 	"strings"
 )
 
 // Util function
 
-var shiftIndex = []int{24, 16, 8, 0}
-
-func CheckIP(ip string) (uint32, error) {
-	var ps = strings.Split(ip, ".")
-	if len(ps) != 4 {
-		return 0, fmt.Errorf("invalid ip address `%s`", ip)
+func ParseIP(ip string) ([]byte, error) {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return nil, fmt.Errorf("invalid ip address: %s", ip)
 	}
 
-	var val uint32
-	for i, s := range ps {
-		d, err := strconv.Atoi(s)
-		if err != nil {
-			return 0, fmt.Errorf("the %dth part `%s` is not an integer", i, s)
-		}
-
-		if d < 0 || d > 255 {
-			return 0, fmt.Errorf("the %dth part `%s` should be an integer bettween 0 and 255", i, s)
-		}
-
-		val |= uint32(d) << shiftIndex[i]
+	v4 := parsedIP.To4()
+	if v4 != nil {
+		return v4, nil
 	}
 
-	return val, nil
+	v6 := parsedIP.To16()
+	if v6 != nil {
+		return v6, nil
+	}
+
+	return nil, fmt.Errorf("invalid ip address: %s", ip)
 }
 
-func Long2IP(ip uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d", (ip>>24)&0xFF, (ip>>16)&0xFF, (ip>>8)&0xFF, (ip>>0)&0xFF)
+var bitMaskList = []uint8{
+	0b1111_1111, // all zero
+	0b0111_1111,
+	0b0011_1111,
+	0b0001_1111,
+	0b0000_1111,
+	0b0000_0111,
+	0b0000_0011,
+	0b0000_0001,
 }
 
-func MidIP(sip uint32, eip uint32) uint32 {
-	return uint32((uint64(sip) + uint64(eip)) >> 1)
+func CIDR2Range(cidrStr string) ([]byte, []byte, error) {
+	prefix, err := netip.ParsePrefix(cidrStr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Get the start IP (Network Address)
+	// Masked() zeros out the host bits, which gives the starting IP of the subnet.
+	sip := prefix.Masked().Addr().AsSlice()
+	ipl := len(sip)
+	eip := make([]byte, ipl)
+	copy(eip, sip)
+
+	// Calculate the end IP (Broadcast Address)
+	bits := prefix.Bits()
+
+	// border byte rest bit filled with 1
+	byteIdx := bits / 8
+
+	// check and fill the border byte bits.
+	// @Note this check is possible since there will be bits
+	// like 32 in IPv4 and 128 in IPv6.
+	// fmt.Printf("%s -> bits=%d, byteIdx=%d, maskIdx=%d\n", cidrStr, bits, byteIdx, bits-byteIdx*8)
+	if byteIdx < ipl {
+		eip[byteIdx] |= bitMaskList[bits-(byteIdx*8)]
+	}
+
+	// fill all the rest bits with 1
+	for bi := byteIdx + 1; bi < ipl; bi++ {
+		eip[bi] |= 0b1111_1111
+	}
+
+	return sip, eip, nil
 }
 
-func IterateSegments(handle *os.File, before func(l string), cb func(seg *Segment) error) error {
+func IP2String(ip []byte) string {
+	return net.IP(ip[:]).String()
+}
+
+func IP2Long(ip []byte) *big.Int {
+	return big.NewInt(0).SetBytes(ip)
+}
+
+// IPCompare compares two IP addresses
+// Returns: -1 if ip1 < ip2, 0 if ip1 == ip2, 1 if ip1 > ip2
+func IPCompare(ip1, ip2 []byte) int {
+	// for i := 0; i < len(ip1); i++ {
+	// 	if ip1[i] < ip2[i] {
+	// 		return -1
+	// 	}
+
+	// 	if ip1[i] > ip2[i] {
+	// 		return 1
+	// 	}
+	// }
+
+	// return 0
+	return bytes.Compare(ip1, ip2)
+}
+
+func IPAddOne(ip []byte) []byte {
+	var r = make([]byte, len(ip))
+	copy(r, ip)
+	for i := len(ip) - 1; i >= 0; i-- {
+		r[i]++
+		if r[i] != 0 { // No overflow
+			break
+		}
+	}
+
+	return r
+}
+
+func IPSubOne(ip []byte) []byte {
+	var r = make([]byte, len(ip))
+	copy(r, ip)
+	for i := len(ip) - 1; i >= 0; i-- {
+		if r[i] != 0 { // No borrow needed
+			r[i]--
+			break
+		}
+		r[i] = 0xFF // borrow from the next byte
+	}
+
+	return r
+}
+
+// IPAdd add the spcecified two byte ip
+func IPAdd(sip, eip []byte) ([]byte, error) {
+	if len(sip) != len(eip) {
+		return []byte{}, fmt.Errorf("length of the two ips are not the same")
+	}
+
+	var carry uint16 = 0
+	var result = make([]byte, len(sip)+1)
+
+	for i := len(sip) - 1; i >= 0; i-- {
+		sum := uint16(sip[i]) + uint16(eip[i]) + carry
+		result[i+1] = byte(sum) // Store standard 8-bit result
+		carry = sum >> 8        // Extract the 1-bit carry for the next byte
+	}
+
+	// check and append the carry
+	if carry > 0 {
+		result[0] = byte(carry)
+		return result, nil
+	} else {
+		return result[1:], nil
+	}
+}
+
+// IPHalf get the half value of an input byte ip
+func IPHalf(ip []byte) []byte {
+	var length = len(ip)
+	var result = make([]byte, length)
+	// Tracks the bit falling off from the previous byte
+	var carry byte = 0
+
+	for i := 0; i < length; i++ {
+		// 1. Shift current byte right by 1
+		// 2. Or (|) with the carry from the previous byte (shifted to the MSB position)
+		result[i] = (ip[i] >> 1) | (carry << 7)
+
+		// 3. Capture the Least Significant Bit (LSB) to use as carry for the next byte
+		carry = ip[i] & 1
+	}
+
+	return result
+}
+
+// IPMiddle get the middle value of two input ip address
+func IPMiddle(sip, eip []byte) ([]byte, error) {
+	buf, err := IPAdd(sip, eip)
+	if err != nil {
+		return []byte{}, fmt.Errorf("IPSub(%s, %s): %w", IP2String(sip), IP2String(eip), err)
+	}
+
+	return IPHalf(buf), nil
+}
+
+func IterateSegmentsFull(reader io.Reader, sep string, autoMerge bool, before func(l string), filter func(region string) (string, error), cRegion func(string) *Region, done func(seg *Segment) error) (int, int, error) {
 	var last *Segment = nil
-	var scanner = bufio.NewScanner(handle)
+	var totalCount, mergeCount = 0, 0
+	var scanner = bufio.NewScanner(reader)
 	scanner.Split(bufio.ScanLines)
 	for scanner.Scan() {
 		var l = strings.TrimSpace(strings.TrimSuffix(scanner.Text(), "\n"))
@@ -61,54 +202,46 @@ func IterateSegments(handle *os.File, before func(l string), cb func(seg *Segmen
 			continue
 		}
 
+		totalCount++
 		if before != nil {
 			before(l)
 		}
 
-		var ps = strings.SplitN(l, "|", 3)
-		if len(ps) != 3 {
-			return fmt.Errorf("invalid ip segment line `%s`", l)
-		}
-
-		sip, err := CheckIP(ps[0])
+		sip, eip, region, err := ParseSegment(l, sep)
 		if err != nil {
-			return fmt.Errorf("check start ip `%s`: %s", ps[0], err)
+			return totalCount, mergeCount, err
 		}
 
-		eip, err := CheckIP(ps[1])
-		if err != nil {
-			return fmt.Errorf("check end ip `%s`: %s", ps[1], err)
-		}
-
-		if sip > eip {
-			return fmt.Errorf("start ip(%s) should not be greater than end ip(%s)", ps[0], ps[1])
-		}
-
-		if len(ps[2]) < 1 {
-			return fmt.Errorf("empty region info in segment line `%s`", l)
+		// check and do the region filter
+		if filter != nil {
+			region, err = filter(region)
+			if err != nil {
+				return totalCount, mergeCount, fmt.Errorf("failed to filter region `%s`: %s", region, err)
+			}
 		}
 
 		var seg = &Segment{
 			StartIP: sip,
 			EndIP:   eip,
-			Region:  ps[2],
+			Region:  cRegion(region),
 		}
 
-		// check and automatic merging the Consecutive Segments which means:
+		// check and automatic merging the Consecutive Segments, which means:
 		// 1, region info is the same
 		// 2, last.eip+1 = cur.sip
 		if last == nil {
 			last = seg
 			continue
-		} else if last.Region == seg.Region {
-			if err = seg.AfterCheck(last); err == nil {
+		} else if autoMerge && last.Region.Equal(seg.Region) {
+			if err = seg.RightBehind(last); err == nil {
+				mergeCount++
 				last.EndIP = seg.EndIP
 				continue
 			}
 		}
 
-		if err = cb(last); err != nil {
-			return err
+		if err = done(last); err != nil {
+			return totalCount, mergeCount, err
 		}
 
 		// reset the last
@@ -117,23 +250,31 @@ func IterateSegments(handle *os.File, before func(l string), cb func(seg *Segmen
 
 	// process the last segment
 	if last != nil {
-		return cb(last)
+		return totalCount, mergeCount, done(last)
 	}
 
-	return nil
+	return totalCount, mergeCount, nil
+}
+
+func IterateSegments(reader io.Reader, autoMerge bool, before func(l string), filter func(region string) (string, error), cRegion func(string) *Region, done func(seg *Segment) error) (int, int, error) {
+	return IterateSegmentsFull(reader, "|", autoMerge, before, filter, cRegion, done)
+}
+
+func IterateSegmentsBase(reader io.Reader, done func(seg *Segment) error) (int, int, error) {
+	return IterateSegmentsFull(reader, "|", false, nil, nil, NewRegion, done)
 }
 
 func CheckSegments(segList []*Segment) error {
 	var last *Segment
 	for _, seg := range segList {
 		// sip must <= eip
-		if seg.StartIP > seg.EndIP {
+		if IPCompare(seg.StartIP, seg.EndIP) > 0 {
 			return fmt.Errorf("segment `%s`: start ip should not be greater than end ip", seg.String())
 		}
 
 		// check the continuity of the data segment
 		if last != nil {
-			if last.EndIP+1 != seg.StartIP {
+			if IPCompare(IPAddOne(last.EndIP), seg.StartIP) != 0 {
 				return fmt.Errorf("discontinuous segment `%s`: last.eip+1 != cur.sip", seg.String())
 			}
 		}
@@ -142,4 +283,98 @@ func CheckSegments(segList []*Segment) error {
 	}
 
 	return nil
+}
+
+// check and merge the continuous segments with the same region
+func MergeSegments(segList []*Segment) []*Segment {
+	var err error
+	var last *Segment = nil
+	var mergedList []*Segment
+	for _, seg := range segList {
+		// check and automatic merging the Consecutive Segments, which means:
+		// 1, region info is the same
+		// 2, last.eip+1 = cur.sip
+		if last == nil {
+			last = seg
+			continue
+		} else if last.Region.Equal(seg.Region) {
+			if err = seg.RightBehind(last); err == nil {
+				last.EndIP = seg.EndIP
+				continue
+			}
+		}
+
+		// append the segment
+		mergedList = append(mergedList, last)
+
+		// track the last value
+		last = seg
+	}
+
+	// process the last segment
+	if last != nil {
+		mergedList = append(mergedList, last)
+	}
+
+	return mergedList
+}
+
+func RegionFiltering(region string, fields []int) (string, error) {
+	if len(fields) == 0 {
+		return region, nil
+	}
+
+	fs := strings.Split(region, "|")
+	var sb []string
+	for _, idx := range fields {
+		if idx < 0 {
+			return "", fmt.Errorf("negative filter index %d", idx)
+		}
+
+		if idx >= len(fs) {
+			return "", fmt.Errorf("field index %d exceeded the max length of %d", idx, len(fs))
+		}
+
+		sb = append(sb, fs[idx])
+	}
+
+	return strings.Join(sb, "|"), nil
+}
+
+// do the string split step by step as caller needed
+func StringTokenizer(str, substr string, cb func(s string, start int) bool) []string {
+	var tokens []string
+	var token string
+	var sIdx, oIdx, isEOF = 0, 0, false
+	for {
+		// do the token match
+		nIdx := strings.Index(str[sIdx:], substr)
+		if nIdx == -1 {
+			isEOF = true
+			token = str[sIdx:]
+		} else {
+			token = str[sIdx : sIdx+nIdx]
+		}
+
+		oIdx = sIdx                    // backup the old index
+		sIdx = sIdx + nIdx + 1         // reset the next start index
+		tokens = append(tokens, token) // append the token
+
+		// check and call the callback
+		if cb(token, oIdx) == false {
+			// keep the last token
+			if sIdx < len(str) {
+				tokens = append(tokens, str[sIdx:])
+			}
+
+			break
+		}
+
+		// check the EOF
+		if isEOF {
+			break
+		}
+	}
+
+	return tokens
 }
