@@ -53,38 +53,55 @@
 
 package org.lionsoul.ip2region.xdb;
 
-import java.io.*;
+import org.lionsoul.ip2region.maintenance.MaintenanceFiles;
+import org.lionsoul.ip2region.xdb.Segment.IterateAction;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import org.lionsoul.ip2region.maintenance.MaintenanceFiles;
 import java.util.*;
 
-import org.lionsoul.ip2region.xdb.Segment.IterateAction;
-
-/** 非线程安全的双栈制库器；init、start、end 顺序执行，通过 close 清理失败候选。 */
+/**
+ * 非线程安全的双栈制库器；init、start、end 顺序执行，通过 close 清理失败候选。
+ */
 public class Maker implements AutoCloseable {
-    /** 最终 xdb 路径；仅 end 成功后原子替换，构造和校验阶段不修改它。 */
+    /**
+     * 最终 xdb 路径；仅 end 成功后原子替换，构造和校验阶段不修改它。
+     */
     private final Path destinationPath;
-    /** 同目录候选库；close 清理未发布候选，生命周期仅限本次制库。 */
+    /**
+     * 同目录候选库；close 清理未发布候选，生命周期仅限本次制库。
+     */
     private final Path candidatePath;
-    /** init 成功后为 true，禁止重复初始化同一候选库。 */
+    /**
+     * init 成功后为 true，禁止重复初始化同一候选库。
+     */
     private boolean initialized;
-    /** start 进入后为 true，禁止失败后直接重复写入候选文件。 */
+    /**
+     * start 进入后为 true，禁止失败后直接重复写入候选文件。
+     */
     private boolean generationStarted;
-    /** start 完整写完索引后才为 true，禁止发布未完成库；实例非线程安全。 */
+    /**
+     * start 完整写完索引后才为 true，禁止发布未完成库；实例非线程安全。
+     */
     private boolean generationComplete;
-    /** end 成功发布后为 true；close 此时只执行幂等句柄关闭。 */
+    /**
+     * end 成功发布后为 true；close 此时只执行幂等句柄关闭。
+     */
     private boolean published;
 
     // constants define
-    public static final int VersionNo         = 3;  // 2 for XDB 2.0, 3 for XDB 3.0
-    public static final int HeaderInfoLength  = 256;
-    public static final int VectorIndexRows   = 256;
-    public static final int VectorIndexCols   = 256;
-    public static final int VectorIndexSize   = 8;  // in bytes
-    public static final int RuntimePtrSize    = 4;  // in bytes
-    public static final long MaxFilePointer   = (1L << (RuntimePtrSize * 8)) - 1;
+    public static final int VersionNo = 3;  // 2 for XDB 2.0, 3 for XDB 3.0
+    public static final int HeaderInfoLength = 256;
+    public static final int VectorIndexRows = 256;
+    public static final int VectorIndexCols = 256;
+    public static final int VectorIndexSize = 8;  // in bytes
+    public static final int RuntimePtrSize = 4;  // in bytes
+    public static final long MaxFilePointer = (1L << (RuntimePtrSize * 8)) - 1;
     public static final int VectorIndexLength = VectorIndexRows * VectorIndexCols * VectorIndexSize;
 
     public static final Log log = Log.getLogger(Maker.class);
@@ -113,12 +130,13 @@ public class Maker implements AutoCloseable {
 
     /**
      * 创建独立候选库，不修改现有正式输出；禁止输入与输出指向同一文件。
+     *
      * @param version IPv4 或 IPv6 版本
-     * @param policy 索引策略
+     * @param policy  索引策略
      * @param srcPath 源文本路径
      * @param dstPath 正式库路径，父目录须存在
-     * @param fields region 字段索引，空数组保留全部
-     * @throws IOException 源文件不存在或候选创建失败
+     * @param fields  region 字段索引，空数组保留全部
+     * @throws IOException              源文件不存在或候选创建失败
      * @throws IllegalArgumentException 输入输出是同一文件
      */
     public Maker(Version version, int policy, String srcPath, String dstPath, int[] fields) throws IOException {
@@ -135,7 +153,7 @@ public class Maker implements AutoCloseable {
         }
 
         this.version = version;
-        this.fields  = fields;
+        this.fields = fields;
 
         this.bytesCharset = Charset.forName("utf-8");
         this.segments = new ArrayList<Segment>();
@@ -212,7 +230,7 @@ public class Maker implements AutoCloseable {
             public void handle(Segment seg) throws Exception {
                 // ip version check
                 if (seg.startIP.length != version.bytes) {
-                    throw new Exception("invalid ip segment("+version.name+" expected)");
+                    throw new Exception("invalid ip segment(" + version.name + " expected)");
                 }
 
                 if (sorting) {
@@ -242,7 +260,9 @@ public class Maker implements AutoCloseable {
         // check and sort all the segments
         if (sorting) {
             log.infof("try to sort all the segments based on its start ip ...");
-            segments.sort((o1, o2) -> {return Util.ipCompare(o1.startIP, o2.startIP);});
+            segments.sort((o1, o2) -> {
+                return Util.ipCompare(o1.startIP, o2.startIP);
+            });
 
             log.infof("try to check if there is overlap in the segments  ...");
             Segment last = null;
@@ -250,7 +270,7 @@ public class Maker implements AutoCloseable {
                 // check the order of the data segment
                 if (last != null && !seg.after(last)) {
                     throw new Exception("overlap checking: last.eip("
-                       + Util.ipToString(last.endIP)+") >= seg.sip("+ Util.ipToString(seg.startIP) + ", "+ seg.region +")");
+                            + Util.ipToString(last.endIP) + ") >= seg.sip(" + Util.ipToString(seg.startIP) + ", " + seg.region + ")");
                 }
 
                 // reset the last
@@ -259,13 +279,14 @@ public class Maker implements AutoCloseable {
         }
 
         log.infof(
-            "all segments loaded, length: %d, sorting: %s, elapsed: %d ms", 
-            segments.size(), sorting ? "true" : "false", System.currentTimeMillis() - tStart
+                "all segments loaded, length: %d, sorting: %s, elapsed: %d ms",
+                segments.size(), sorting ? "true" : "false", System.currentTimeMillis() - tStart
         );
     }
 
     /**
      * 向候选文件写入头部并校验全部源段，不修改正式库。
+     *
      * @throws Exception 头部写入或源段加载失败
      */
     public void init() throws Exception {
@@ -296,6 +317,7 @@ public class Maker implements AutoCloseable {
 
     /**
      * 写入候选的数据、向量及区间索引；任一步失败都不会标记为可发布。
+     *
      * @throws Exception 源段为空或二进制写入失败
      */
     public void start() throws Exception {
@@ -325,7 +347,7 @@ public class Maker implements AutoCloseable {
                 // allow empty region info
                 // throw new Exception("empty region info for segment `"+seg+"`");
             } else if (regionBuff.length > 0xFFFF) {
-                throw new Exception("too long region info `"+seg.region+"`: should be less than 65535 bytes");
+                throw new Exception("too long region info `" + seg.region + "`: should be less than 65535 bytes");
             }
 
             // record the current ptr
@@ -351,7 +373,7 @@ public class Maker implements AutoCloseable {
             // we need the region ptr
             final DataEntry e = regionPool.get(seg.region);
             if (e == null) {
-                throw new Exception("missing ptr cache for region `"+seg.region+"`");
+                throw new Exception("missing ptr cache for region `" + seg.region + "`");
             }
 
             int _offset = 0;
@@ -403,25 +425,29 @@ public class Maker implements AutoCloseable {
 
         generationComplete = true;
         log.infof("write done, dataBlocks: %d, indexBlocks: (%d, %d), indexPtr: (%d, %d)",
-            regionPool.size(), segments.size(), counter, startIndexPtr, endIndexPtr);
+                regionPool.size(), segments.size(), counter, startIndexPtr, endIndexPtr);
     }
 
     /**
      * 关闭已完成候选库并原子发布；不支持原子替换或生成未完成时保留旧库。
-     * @throws IOException 关闭或发布失败
+     *
+     * @throws IOException           关闭或发布失败
      * @throws IllegalStateException start 未完整完成或候选已经发布
      */
     public void end() throws IOException {
         if (!generationComplete || published) {
             throw new IllegalStateException("xdb generation incomplete or already published: " + destinationPath);
         }
+        log.infof("准备原子发布 xdb: candidate=%s, dst=%s", candidatePath, destinationPath);
         this.dstHandle.close();
         MaintenanceFiles.publishMaintenanceFile(candidatePath, destinationPath);
         published = true;
+        log.infof("xdb 原子发布完成: dst=%s", destinationPath);
     }
 
     /**
      * 释放文件句柄并删除失败或未发布的候选；不会发布半成品库。
+     *
      * @throws IOException 关闭或删除失败，原异常保持为主异常
      */
     @Override

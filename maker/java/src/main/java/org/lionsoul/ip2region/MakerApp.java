@@ -23,16 +23,23 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** 源码级双栈制库入口；候选文件全部生成成功后才替换正式库。 */
+/**
+ * 源码级双栈制库入口；候选文件全部生成成功后才替换正式库。
+ */
 public class MakerApp {
 
-    /** 制库进度与参数日志。 */
+    /**
+     * 制库进度与参数日志。
+     */
     public final static Log log = Log.getLogger(MakerApp.class);
-    /** 字段索引或区间表达式，只允许非负整数。 */
+    /**
+     * 字段索引或区间表达式，只允许非负整数。
+     */
     public final static Pattern p = Pattern.compile("^(\\d+(-\\d+)?)$");
 
     /**
      * 输出制库用法。
+     *
      * @param args 保留入口参数，当前不读取
      */
     public static void printHelp(String[] args) {
@@ -48,6 +55,7 @@ public class MakerApp {
 
     /**
      * 解析字段选择；非法表达式抛错，禁止失败后继续制库。
+     *
      * @param fieldList 字段列表，空串表示保留全部
      * @return 排序后的字段索引
      */
@@ -55,7 +63,7 @@ public class MakerApp {
         final ArrayList<Integer> list = new ArrayList<Integer>();
         final Map<String, String> map = new HashMap<String, String>();
         if (!fieldList.isEmpty()) {
-            String[] fList =  fieldList.split(",");
+            String[] fList = fieldList.split(",");
             for (String f : fList) {
                 final String s = f.trim();
                 if (s.isEmpty()) {
@@ -127,6 +135,7 @@ public class MakerApp {
 
     /**
      * 在独立候选文件制库，成功后原子发布；失败保留输入和已有输出。
+     *
      * @param args src、dst、version 及可选字段/日志参数
      * @throws Exception 参数非法、源数据错误或文件生成失败
      */
@@ -177,18 +186,22 @@ public class MakerApp {
             throw new IllegalArgumentException("maker source and destination must differ: " + source);
         }
         long tStart = System.currentTimeMillis();
-        log.infof("Generating xdb with src=%s, dst=%s, logLevel=%s", source, destination, logLevel);
         MakerApp.log.setLevel(logLevel);
+        Maker.log.setLevel(logLevel);
+        log.infof("Generating xdb: version=%s, src=%s, srcBytes=%d, dst=%s, logLevel=%s",
+                ipVersion, source, Files.size(source), destination, logLevel);
         try (Maker maker = new Maker(version, indexPolicy, source.toString(), destination.toString(), fields)) {
             maker.init();
             maker.start();
             maker.end();
         }
-        log.infof("Done, elapsed: %d s", (System.currentTimeMillis() - tStart) / 1000);
+        log.infof("xdb 已发布: dst=%s, bytes=%d, elapsedMs=%d",
+                destination, Files.size(destination), System.currentTimeMillis() - tStart);
     }
 
     /**
      * 命令行制库；无参数仅显示帮助，执行失败打印参数、原因和完整堆栈并向 JVM 传播。
+     *
      * @param args 制库命令参数
      * @throws Exception 制库失败，命令行以非零退出
      */

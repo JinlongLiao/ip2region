@@ -1,12 +1,14 @@
 package org.lionsoul.ip2region.merge;
 
+import static org.junit.Assert.*;
+
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.lionsoul.ip2region.MakerApp;
-import org.lionsoul.ip2region.merge.ip.pojo.AreaIsp;
 import org.lionsoul.ip2region.merge.ip.IpAreaNormalizer;
 import org.lionsoul.ip2region.merge.ip.IpHelper;
+import org.lionsoul.ip2region.merge.ip.pojo.AreaIsp;
 import org.lionsoul.ip2region.xdb.IndexPolicy;
 import org.lionsoul.ip2region.xdb.Maker;
 import org.lionsoul.ip2region.xdb.Version;
@@ -14,29 +16,28 @@ import org.lionsoul.ip2region.xdb.Version;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Objects;
-import java.util.stream.Stream;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.TimeUnit;
-import java.nio.file.Paths;
+import java.util.stream.Stream;
 
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
-
-/** 在独立目录验证采集、旧格式迁移、合并、清理和制库，不请求真实供应方。 */
+/**
+ * 在独立目录验证采集、旧格式迁移、合并、清理和制库，不请求真实供应方。
+ */
 public class Ipv4WorkflowTest {
-    /** 每条测试隔离文件，失败也不触碰真实数据。 */
+    /**
+     * 每条测试隔离文件，失败也不触碰真实数据。
+     */
     @Rule
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
 
-    /** 旧格式必须显式解释，不能将旧 ISP 当作新版地区代码。 */
+    /**
+     * 旧格式必须显式解释，不能将旧 ISP 当作新版地区代码。
+     */
     @Test
     public void requireExplicitLegacyFormat() throws Exception {
         String legacy = "1.0.0.0|1.0.0.255|日本|0|东京|东京|电信";
@@ -53,7 +54,9 @@ public class Ipv4WorkflowTest {
         assertEquals(Collections.singletonList(legacy), Files.readAllLines(source, StandardCharsets.UTF_8));
     }
 
-    /** 所有省份沿用实际采集行为；最终地址不会无符号回绕，结果写在外部文件。 */
+    /**
+     * 所有省份沿用实际采集行为；最终地址不会无符号回绕，结果写在外部文件。
+     */
     @Test
     public void collectExternalFileWithoutAddressWrap() throws Exception {
         Path output = temporaryFolder.newFile().toPath();
@@ -67,7 +70,9 @@ public class Ipv4WorkflowTest {
                 Files.readAllLines(output, StandardCharsets.UTF_8));
     }
 
-    /** 中途采集失败不发布部分文件，也不能丢失上次输出。 */
+    /**
+     * 中途采集失败不发布部分文件，也不能丢失上次输出。
+     */
     @Test
     public void preserveCollectionOutputOnFailure() throws Exception {
         Path output = temporaryFolder.newFile().toPath();
@@ -83,7 +88,9 @@ public class Ipv4WorkflowTest {
         assertEquals(Collections.singletonList("previous"), Files.readAllLines(output, StandardCharsets.UTF_8));
     }
 
-    /** 从旧格式基础数据完成全链路，最后得到可发布的结构版本 3 IPv4 库。 */
+    /**
+     * 从旧格式基础数据完成全链路，最后得到可发布的结构版本 3 IPv4 库。
+     */
     @Test
     public void collectMergeCleanAndGenerateFromLegacySource() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -96,19 +103,21 @@ public class Ipv4WorkflowTest {
                 ip -> new AreaIsp("中国 ", "福建省", "福州市", "供应方ISP"));
         MergeTest.main(new String[]{source.toString(), patch.toString(), merged.toString(), "--source-format=legacy"});
         ReplaceTest.main(new String[]{merged.toString(), cleaned.toString(), "--source-format=latest"});
-        assertEquals(Collections.singletonList("1.0.0.0|1.0.1.255|中国|福建|福州|原ISP|CN"),
+        assertEquals(Collections.singletonList("1.0.0.0|1.0.1.255|中国|福建|福州|供应方ISP|CN"),
                 Files.readAllLines(cleaned, StandardCharsets.UTF_8));
         MakerApp.genDb(new String[]{"--src=" + cleaned, "--dst=" + binary, "--version=ipv4"});
         byte[] bytes = Files.readAllBytes(binary);
         assertTrue(bytes.length > 524544);
         assertEquals(3, bytes[0]);
         assertEquals(4, bytes[16]);
-        assertTrue(new String(bytes, StandardCharsets.UTF_8).contains("中国|福建|福州|原ISP|CN"));
+        assertTrue(new String(bytes, StandardCharsets.UTF_8).contains("中国|福建|福州|供应方ISP|CN"));
         assertEquals(Collections.singletonList("1.0.0.0|1.0.1.255|日本|0|东京|东京|原ISP"),
                 Files.readAllLines(source, StandardCharsets.UTF_8));
     }
 
-    /** 输入输出同文件以及坏源数据都不能破坏原始文本或已有正式库。 */
+    /**
+     * 输入输出同文件以及坏源数据都不能破坏原始文本或已有正式库。
+     */
     @Test
     public void protectSourceAndExistingBinaryOnMakerFailure() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -131,7 +140,9 @@ public class Ipv4WorkflowTest {
         }
     }
 
-    /** 国家修复与 Python 采用同一份资源，区域和特殊标签不被强行映射。 */
+    /**
+     * 国家修复与 Python 采用同一份资源，区域和特殊标签不被强行映射。
+     */
     @Test
     public void shareCountryRulesWithMigrationScripts() {
         assertEquals("AU", Ipv4CountryNormalizer.resolveIpv4CountryCode("澳大利亚"));
@@ -144,7 +155,10 @@ public class Ipv4WorkflowTest {
             assertEquals("0", Ipv4CountryNormalizer.resolveIpv4CountryCode(region));
         }
     }
-    /** 港澳台改写为 中国|香港、中国|澳门、中国|台湾 并解析为 CN，与存量数据一致。 */
+
+    /**
+     * 港澳台改写为 中国|香港、中国|澳门、中国|台湾 并解析为 CN，与存量数据一致。
+     */
     @Test
     public void normalizeHongKongMacaoTaiwanAsChinaProvince() {
         for (String region : Arrays.asList("香港", "澳门", "台湾")) {
@@ -155,7 +169,9 @@ public class Ipv4WorkflowTest {
         }
     }
 
-    /** 未完整写完索引前调用 end 必须失败；直接使用制库 API 也不能覆盖旧库。 */
+    /**
+     * 未完整写完索引前调用 end 必须失败；直接使用制库 API 也不能覆盖旧库。
+     */
     @Test
     public void directMakerApiNeverPublishesPartialOutput() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -171,7 +187,10 @@ public class Ipv4WorkflowTest {
         }
         assertArrayEquals(previous, Files.readAllBytes(output));
     }
-    /** 实际命令行失败必须非零退出，且错误输出带参数、原因和堆栈。 */
+
+    /**
+     * 实际命令行失败必须非零退出，且错误输出带参数、原因和堆栈。
+     */
     @Test
     public void makerCommandReportsFailureWithNonzeroExit() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -189,7 +208,10 @@ public class Ipv4WorkflowTest {
         assertTrue(error.contains("at org.lionsoul.ip2region.MakerApp"));
         assertEquals(Collections.singletonList("original source"), Files.readAllLines(source, StandardCharsets.UTF_8));
     }
-    /** 无参数仍从原有源码范围开始，不要求 CLI；用首个样本抛错避免联网或覆盖文件。 */
+
+    /**
+     * 无参数仍从原有源码范围开始，不要求 CLI；用首个样本抛错避免联网或覆盖文件。
+     */
     @Test
     public void keepCodeConfiguredRangeWithoutArguments() throws Exception {
         IpHelper originalHelper = IpLoopTest.ipHelper;

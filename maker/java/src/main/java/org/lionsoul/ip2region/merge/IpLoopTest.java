@@ -7,6 +7,8 @@ import org.lionsoul.ip2region.merge.ip.BaiduQifuIpHelper;
 import org.lionsoul.ip2region.merge.ip.IpHelper;
 import org.lionsoul.ip2region.merge.ip.RateLimitedRoundRobinIpHelper;
 import org.lionsoul.ip2region.merge.ip.pojo.AreaIsp;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -23,13 +25,18 @@ import java.util.Objects;
  */
 public class IpLoopTest {
     /**
+     * 输出命令行采集进度及每个样本的原始查询结果。
+     */
+    private static final Logger log = LoggerFactory.getLogger(IpLoopTest.class);
+
+    /**
      * 无参数运行时的起始 IPv4；按原项目方式直接在源码维护候选范围。
      */
-    private static final String DEFAULT_START_IP = "36.6.27.0";
+    private static final String DEFAULT_START_IP = "117.64.64.0";
     /**
      * 无参数运行时包含的结束 IPv4，保持原项目范围不变。
      */
-    private static final String DEFAULT_END_IP = "36.192.160.255";
+    private static final String DEFAULT_END_IP = "117.66.199.255";
     /**
      * 默认外部补丁文件，相对当前工作目录；不写入 classpath 或 jar 资源。
      */
@@ -60,7 +67,7 @@ public class IpLoopTest {
 
     /**
      * 先校验范围与输出目录，再采集到临时文件；成功完成后才原子替换结果。
-     * 样本查询返回空时跳过；异常或中断时停止，不发布半份结果。
+     * 记录开始、逐项查询及完成进度；样本查询返回空时跳过，异常或中断时停止，不发布半份结果。
      * 使用 long 步进，确保 255.255.255.255 之后不会回绕到 0.0.0.0。
      *
      * @param startAddress 起始样本 IPv4
@@ -77,6 +84,7 @@ public class IpLoopTest {
             throw new IllegalArgumentException("invalid IPv4 collection range or helper");
         }
         Path destination = output.toAbsolutePath().normalize();
+        log.info("IPv4 采集开始：startIp={}，endIp={}，output={}", startAddress, endAddress, destination);
         Path candidate = Files.createTempFile(destination.getParent(), "ipv4-collect-", ".csv");
         try {
             try (BufferedWriter writer = Files.newBufferedWriter(candidate, StandardCharsets.UTF_8)) {
@@ -85,7 +93,9 @@ public class IpLoopTest {
                         throw new IOException("IPv4 collection interrupted at " + IpConveter.longToIp(address));
                     }
                     String ip = IpConveter.longToIp(address);
+                    log.info("IPv4 开始查询：ip={}", ip);
                     AreaIsp areaIsp = ipv4IpHelper.queryIp(ip);
+                    log.info("IPv4 查询结果：ip={}，result={}", ip, areaIsp);
                     if (Thread.currentThread().isInterrupted()) {
                         throw new IOException("IPv4 collection interrupted after query " + ip);
                     }
@@ -95,18 +105,15 @@ public class IpLoopTest {
                     String country = Ipv4CountryNormalizer.normalizeIpv4Country(areaIsp.getCountry());
                     String province = StringUtil.isBlank(areaIsp.getProvince()) ? "0" : areaIsp.getProvince();
                     String city = StringUtil.isBlank(areaIsp.getCity()) ? "0" : areaIsp.getCity();
-                    String isp = StringUtil.isBlank(areaIsp.getIsp()) ? "0" : areaIsp.getIsp();
+                    String isp = StringUtil.isBlank(areaIsp.getIsp()) ? "0"
+                            : MergeRegionItem.normalizeIpv4Operator(areaIsp.getIsp());
                     String[] fields = {ip, "0", "0", "0", country, province, city, isp};
-                    for (String field : fields) {
-                        if (field.contains(",") || field.contains("\n") || field.contains("\r")) {
-                            throw new IllegalArgumentException("invalid CSV field for IPv4 " + ip + ": " + field);
-                        }
-                    }
-                    writer.write(String.join(",", fields));
+                    writer.write(Ipv4PatchCsv.formatIpv4PatchCsv(fields));
                     writer.newLine();
                 }
             }
             MaintenanceFiles.publishMaintenanceFile(candidate, destination);
+            log.info("IPv4 采集完成：output={}", destination);
         } finally {
             Files.deleteIfExists(candidate);
         }

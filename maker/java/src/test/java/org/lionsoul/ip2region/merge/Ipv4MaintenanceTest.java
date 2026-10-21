@@ -1,5 +1,8 @@
 package org.lionsoul.ip2region.merge;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
+
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -11,16 +14,19 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThrows;
-
-/** 对隔离数据副本验证新版字段、区间拆分和清理行为，不调用网络采集器。 */
+/**
+ * 对隔离数据副本验证新版字段、区间拆分和清理行为，不调用网络采集器。
+ */
 public class Ipv4MaintenanceTest {
-    /** 每个测试独立创建文件，禁止触碰真实数据。 */
+    /**
+     * 每个测试独立创建文件，禁止触碰真实数据。
+     */
     @Rule
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
 
-    /** 新格式读取时，ISP 和地区代码不能错位。 */
+    /**
+     * 新格式读取时，ISP 和地区代码不能错位。
+     */
     @Test
     public void parseLatestFields() {
         RegionItem region = new RegionItem("1.0.0.0|1.0.0.255|中国|福建|福州|电信|CN");
@@ -30,7 +36,9 @@ public class Ipv4MaintenanceTest {
         assertEquals("CN", region.getCode());
     }
 
-    /** 内部、头部、尾部与全覆盖补丁均应只改变目标 /24，输出保持连续。 */
+    /**
+     * 内部、头部、尾部与全覆盖补丁均应只改变目标 /24，输出保持连续。
+     */
     @Test
     public void splitPatchAtAllBoundaries() throws Exception {
         for (String address : Arrays.asList("1.0.0.9", "1.0.1.9", "1.0.2.9")) {
@@ -46,7 +54,7 @@ public class Ipv4MaintenanceTest {
             for (String line : lines) {
                 RegionItem region = new RegionItem(line);
                 assertEquals(previous + 1, region.getStart());
-                assertEquals("电信", region.getIsp());
+                assertEquals(region.between(address) ? "采集ISP" : "电信", region.getIsp());
                 assertEquals("CN", region.getCode());
                 assertEquals(region.between(address) ? "新省" : "旧省", region.getProvince());
                 previous = region.getEnd();
@@ -56,7 +64,34 @@ public class Ipv4MaintenanceTest {
         }
     }
 
-    /** 一个补丁跨越多个源段时保留各段 ISP，国家改变时补齐新地区代码。 */
+    /**
+     * 八列补丁覆盖并简化运营商名称，未知或缺失运营商保留旧值。
+     */
+    @Test
+    public void mergeNormalizedIpv4Operators() throws Exception {
+        for (String operator : Arrays.asList("中国电信", "中国移动", "中国联通", "中国广电", "海外ISP", "", "0", "  ")) {
+            Path source = temporaryFolder.newFile().toPath();
+            Path patch = temporaryFolder.newFile().toPath();
+            Files.write(source, Collections.singletonList("117.64.244.0|117.64.244.255|中国|安徽|合肥|旧ISP|CN"), StandardCharsets.UTF_8);
+            Files.write(patch, Collections.singletonList("117.64.244.106,0,0,0,中国,安徽,合肥," + operator), StandardCharsets.UTF_8);
+            MergeTest.main(new String[]{source.toString(), patch.toString(), "--source-format=latest"});
+            String expected = operator.trim();
+            if (expected.startsWith("中国")) {
+                expected = expected.substring(2);
+            }
+            if (expected.isEmpty() || "0".equals(expected)) {
+                expected = "旧ISP";
+            }
+            assertEquals(Collections.singletonList("117.64.244.0|117.64.244.255|中国|安徽|合肥|" + expected + "|CN"),
+                    Files.readAllLines(source, StandardCharsets.UTF_8));
+        }
+        assertEquals(false, new MergeRegionItem("1.0.0.1,0,0,0,中国,甲,乙,电信")
+                .equals(new MergeRegionItem("1.0.0.1,0,0,0,中国,甲,乙,移动")));
+    }
+
+    /**
+     * 一个补丁跨越多个源段时保留各段 ISP，国家改变时补齐新地区代码。
+     */
     @Test
     public void patchAcrossSegmentsAndRepairCountryCode() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -69,7 +104,9 @@ public class Ipv4MaintenanceTest {
                 "1.0.0.128|1.0.0.255|日本|东京|东京|联通|JP"), Files.readAllLines(source, StandardCharsets.UTF_8));
     }
 
-    /** 明确国家的旧占位代码先补齐，再合并相邻记录；坏输入不得覆盖源文件。 */
+    /**
+     * 明确国家的旧占位代码先补齐，再合并相邻记录；坏输入不得覆盖源文件。
+     */
     @Test
     public void repairCountryCodesAndRejectInvalidSource() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -86,7 +123,9 @@ public class Ipv4MaintenanceTest {
         assertEquals(Collections.singletonList("invalid"), Files.readAllLines(source, StandardCharsets.UTF_8));
     }
 
-    /** 清理仅修改省市后缀，不改国家、ISP 或地区代码，且拒绝覆盖输入原件。 */
+    /**
+     * 清理仅修改省市后缀，不改国家、ISP 或地区代码，且拒绝覆盖输入原件。
+     */
     @Test
     public void cleanOnlyProvinceAndCity() throws Exception {
         Path source = temporaryFolder.newFile().toPath();
@@ -98,7 +137,10 @@ public class Ipv4MaintenanceTest {
         assertThrows(IllegalArgumentException.class,
                 () -> ReplaceTest.main(new String[]{source.toString(), source.toString(), "--source-format=latest"}));
     }
-    /** 非法地址不能进入清理区间算法，避免越界段覆盖有效地址。 */
+
+    /**
+     * 非法地址不能进入清理区间算法，避免越界段覆盖有效地址。
+     */
     @Test
     public void rejectMalformedIpv4Address() {
         for (String address : Arrays.asList("1.2.3", "256.0.0.1", "1.2.-1.3", "1.2.3.4.", "")) {
